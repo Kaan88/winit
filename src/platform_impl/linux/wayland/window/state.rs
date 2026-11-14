@@ -115,8 +115,16 @@ pub struct WindowState {
     /// The text inputs observed on the window.
     text_inputs: Vec<ZwpTextInputV3>,
 
-    /// The inner size of the window, as in without client side decorations.
+    /// The inner size of the window, as in without client side decorations. With a content
+    /// margin in force this is the window-geometry size, `margin_now() * 2` smaller than the
+    /// surface in each direction.
     size: LogicalSize<u32>,
+
+    /// Transparent margin (logical px) the app draws around the window geometry, see
+    /// `WindowExtWayland::set_content_margin`. Zero unless the app asked for one.
+    content_margin: u32,
+    /// Whether an input region was ever set for the margin (so it is cleared again).
+    input_region_set: bool,
 
     /// Whether the CSD fail to create, so we don't try to create them on each iteration.
     csd_fails: bool,
@@ -162,6 +170,17 @@ pub struct WindowState {
     frame: Option<WinitFrame>,
 }
 
+/// Logical px outside the content that still take pointer input when a content margin is in
+/// force, so the app has somewhere to start an edge resize.
+const RESIZE_BAND: i32 = 6;
+
+/// The rectangle (surface coordinates) that takes pointer input: the content inside `margin`,
+/// grown by up to `RESIZE_BAND` on every side.
+fn input_rect(margin: i32, content: LogicalSize<u32>) -> (i32, i32, i32, i32) {
+    let band = RESIZE_BAND.min(margin);
+    (margin - band, margin - band, content.width as i32 + 2 * band, content.height as i32 + 2 * band)
+}
+
 impl WindowState {
     /// Create new window state.
     pub fn new(
@@ -192,6 +211,8 @@ impl WindowState {
             cursor_grab_mode: GrabState::new(),
             selected_cursor: Default::default(),
             cursor_visible: true,
+            content_margin: 0,
+            input_region_set: false,
             decorate: true,
             fractional_scale,
             frame: None,
@@ -272,6 +293,8 @@ impl WindowState {
         // properly scale the physical sizes provided by the users.
         if let Some(initial_size) = self.initial_size.take() {
             self.size = initial_size.to_logical(self.scale_factor());
+            // The requested size is a surface size; the geometry is the content inside the margin.
+            self.size = Self::shrink(self.size, self.content_margin);
             self.stateless_size = self.size;
         }
 
@@ -394,7 +417,7 @@ impl WindowState {
         // NOTE: Set the configure before doing a resize, since we query it during it.
         self.last_configure = Some(configure);
 
-        if state_change_requires_resize || new_size != self.inner_size() {
+        if state_change_requires_resize || new_size != self.size {
             self.resize(new_size);
             true
         } else {
@@ -572,10 +595,66 @@ impl WindowState {
         self.ime_allowed
     }
 
-    /// Get the size of the window.
+    /// Get the size of the window: the surface, which is the window geometry plus the content
+    /// margin on every side (no margin: the geometry).
     #[inline]
     pub fn inner_size(&self) -> LogicalSize<u32> {
-        self.size
+        let m = self.margin_now();
+        if self.initial_size.is_some() {
+            // Not configured yet: `size` still is the size the app asked for (a surface size).
+            return self.size;
+        }
+        LogicalSize::new(self.size.width + 2 * m, self.size.height + 2 * m)
+    }
+
+    /// The content margin in force: the requested one while the window is in a normal state and
+    /// has no client-side frame of winit's own, zero when maximized, fullscreen, tiled or framed.
+    pub fn margin_now(&self) -> u32 {
+        self.margin_for(self.last_configure.as_ref())
+    }
+
+    fn margin_for(&self, configure: Option<&WindowConfigure>) -> u32 {
+        let framed = self.frame.as_ref().is_some_and(|frame| !frame.is_hidden());
+        match configure {
+            // NOTE: `is_tiled()` is true only when tiled on all four edges (it is `contains` of
+            // all the `TILED_*` bits), so a half-screen tile needs the `intersects` here.
+            Some(configure)
+                if configure.is_maximized()
+                    || configure.is_fullscreen()
+                    || configure.state.intersects(XdgWindowState::TILED) =>
+            {
+                0
+            },
+            _ if framed => 0,
+            _ => self.content_margin,
+        }
+    }
+
+    fn shrink(size: LogicalSize<u32>, margin: u32) -> LogicalSize<u32> {
+        LogicalSize::new(
+            size.width.saturating_sub(2 * margin).max(1),
+            size.height.saturating_sub(2 * margin).max(1),
+        )
+    }
+
+    /// Set the content margin (logical px) and re-apply the geometry, input and opaque regions.
+    /// The surface keeps its size; the content is what is left inside the margin.
+    pub fn set_content_margin(&mut self, margin: u32) {
+        if margin == self.content_margin {
+            return;
+        }
+        if self.initial_size.is_some() {
+            // First configure not seen: it converts the requested size itself.
+            self.content_margin = margin;
+            return;
+        }
+        // The surface keeps its size: the margin is carved out of it, so a window that was asked
+        // to be 672x472 stays that big and its content becomes 600x400 (margin 36).
+        let surface = self.inner_size();
+        self.content_margin = margin;
+        if self.last_configure.is_some() {
+            self.resize(Self::shrink(surface, self.margin_now()));
+        }
     }
 
     /// Whether the window received initial configure event from the compositor.
@@ -654,6 +733,25 @@ impl WindowState {
         }
     }
 
+    /// With a margin in force only the content grown by `RESIZE_BAND` takes pointer input, so the
+    /// shadow around the window lets clicks through to what is behind it.
+    fn reload_input_region(&mut self) {
+        let surface = self.window.wl_surface();
+        let margin = self.margin_now() as i32;
+        if margin == 0 {
+            // Back to the default (the whole surface), only if a region was set before.
+            if self.input_region_set {
+                surface.set_input_region(None);
+                self.input_region_set = false;
+            }
+        } else if let Ok(region) = Region::new(&*self.compositor) {
+            let (x, y, w, h) = input_rect(margin, self.size);
+            region.add(x, y, w, h);
+            surface.set_input_region(Some(region.wl_region()));
+            self.input_region_set = true;
+        }
+    }
+
     /// Reissue the transparency hint to the compositor.
     pub fn reload_transparency_hint(&self) {
         let surface = self.window.wl_surface();
@@ -661,7 +759,9 @@ impl WindowState {
         if self.transparent {
             surface.set_opaque_region(None);
         } else if let Ok(region) = Region::new(&*self.compositor) {
-            region.add(0, 0, i32::MAX, i32::MAX);
+            // The content margin, if any, is not opaque.
+            let m = self.margin_now() as i32;
+            region.add(m, m, i32::MAX - m, i32::MAX - m);
             surface.set_opaque_region(Some(region.wl_region()));
         } else {
             warn!("Failed to mark window opaque.");
@@ -671,7 +771,10 @@ impl WindowState {
     /// Try to resize the window when the user can do so.
     pub fn request_inner_size(&mut self, inner_size: Size) -> PhysicalSize<u32> {
         if self.last_configure.as_ref().map(Self::is_stateless).unwrap_or(true) {
-            self.resize(inner_size.to_logical(self.scale_factor()))
+            // A surface size: the geometry is what is left inside the margin.
+            let margin = self.margin_now();
+            let surface = inner_size.to_logical(self.scale_factor());
+            self.resize(Self::shrink(surface, margin))
         }
 
         logical_to_physical_rounded(self.inner_size(), self.scale_factor())
@@ -704,18 +807,21 @@ impl WindowState {
         // Reload the hint.
         self.reload_transparency_hint();
 
-        // Set the window geometry.
+        // Set the window geometry; with a content margin it is the rectangle inside the margin.
+        let margin = self.margin_now() as i32;
         self.window.xdg_surface().set_window_geometry(
-            x,
-            y,
+            x + margin,
+            y + margin,
             outer_size.width as i32,
             outer_size.height as i32,
         );
+        self.reload_input_region();
 
         // Update the target viewport, this is used if and only if fractional scaling is in use.
         if let Some(viewport) = self.viewport.as_ref() {
-            // Set inner size without the borders.
-            viewport.set_destination(self.size.width as _, self.size.height as _);
+            // Set inner size without the borders: the whole surface, margin included.
+            let surface = self.inner_size();
+            viewport.set_destination(surface.width as _, surface.height as _);
         }
     }
 
@@ -1216,5 +1322,18 @@ fn into_sctk_adwaita_config(theme: Option<Theme>) -> sctk_adwaita::FrameConfig {
         Some(Theme::Light) => sctk_adwaita::FrameConfig::light(),
         Some(Theme::Dark) => sctk_adwaita::FrameConfig::dark(),
         None => sctk_adwaita::FrameConfig::auto(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn input_region_is_the_content_grown_by_the_band() {
+        // 36 px margin, 600x400 content: the content starts at (36, 36); 6 px more on each side.
+        assert_eq!(input_rect(36, LogicalSize::new(600, 400)), (30, 30, 612, 412));
+        // A margin smaller than the band cannot reach outside the surface.
+        assert_eq!(input_rect(4, LogicalSize::new(600, 400)), (0, 0, 608, 408));
     }
 }

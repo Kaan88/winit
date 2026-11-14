@@ -81,6 +81,22 @@ impl<T> EventLoopBuilderExtWayland for EventLoopBuilder<T> {
 pub trait WindowExtWayland {
     /// Returns `xdg_toplevel` of the window or [`None`] if the window is X11 window.
     fn xdg_toplevel(&self) -> Option<NonNull<c_void>>;
+
+    /// Declare that the window is the inner rectangle of a larger, transparent surface: the app
+    /// draws `margin` logical px of (for example) shadow on every side. See `PATCH.md`.
+    ///
+    /// While the window is in a normal state (not maximized, fullscreen or tiled) and has no
+    /// client-side frame of winit's own, `xdg_surface.set_window_geometry` is the content
+    /// rectangle, sizes from the compositor are content sizes, and [`Window::inner_size`] and
+    /// `Resized` report the SURFACE size (content plus twice the margin), which is the size of the
+    /// buffer to draw; `request_inner_size` and the initial size are surface sizes too, the
+    /// min/max sizes stay content sizes. Only the content (grown by a few px for edge resizing)
+    /// takes pointer input. In the other states the margin is zero. A no-op on X11.
+    fn set_content_margin(&self, margin: u32);
+
+    /// The content margin in force now, in logical px: the one set, or 0 when maximized,
+    /// fullscreen or tiled. A change of it arrives with a `Resized` event.
+    fn content_margin_now(&self) -> u32;
 }
 
 impl WindowExtWayland for Window {
@@ -92,6 +108,27 @@ impl WindowExtWayland for Window {
             crate::platform_impl::Window::X(_) => None,
             #[cfg(wayland_platform)]
             crate::platform_impl::Window::Wayland(window) => window.xdg_toplevel(),
+        }
+    }
+
+    #[inline]
+    fn set_content_margin(&self, margin: u32) {
+        #[allow(clippy::single_match)]
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => {},
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => window.set_content_margin(margin),
+        }
+    }
+
+    #[inline]
+    fn content_margin_now(&self) -> u32 {
+        match &self.window {
+            #[cfg(x11_platform)]
+            crate::platform_impl::Window::X(_) => 0,
+            #[cfg(wayland_platform)]
+            crate::platform_impl::Window::Wayland(window) => window.content_margin_now(),
         }
     }
 }

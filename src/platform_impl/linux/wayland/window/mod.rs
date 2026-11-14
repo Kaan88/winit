@@ -354,6 +354,15 @@ impl Window {
         window_state.set_resize_increments(increments);
     }
 
+    pub fn set_content_margin(&self, margin: u32) {
+        self.window_state.lock().unwrap().set_content_margin(margin);
+        self.request_redraw();
+    }
+
+    pub fn content_margin_now(&self) -> u32 {
+        self.window_state.lock().unwrap().margin_now()
+    }
+
     #[inline]
     pub fn set_transparent(&self, transparent: bool) {
         self.window_state.lock().unwrap().set_transparent(transparent);
